@@ -1,16 +1,29 @@
 # CarND-Path-Planning-Project
-Self-Driving Car Engineer Nanodegree Program
-   
-### Simulator.
-You can download the Term3 Simulator which contains the Path Planning Project from the [releases tab (https://github.com/udacity/self-driving-car-sim/releases/tag/T3_v1.2).
+This project is MaxEtzo's submission for **Path-Planning project** aassignment which is a part of [**Self-Driving Car Engineer Nanodegree's**](https://eu.udacity.com/course/self-driving-car-engineer-nanodegree--nd013) by **Udacity**
 
 ### Goals
 In this project your goal is to safely navigate around a virtual highway with other traffic that is driving +-10 MPH of the 50 MPH speed limit. You will be provided the car's localization and sensor fusion data, there is also a sparse map list of waypoints around the highway. The car should try to go as close as possible to the 50 MPH speed limit, which means passing slower traffic when possible, note that other cars will try to change lanes too. The car should avoid hitting other cars at all cost as well as driving inside of the marked road lanes at all times, unless going from one lane to another. The car should be able to make one complete loop around the 6946m highway. Since the car is trying to go 50 MPH, it should take a little over 5 minutes to complete 1 loop. Also the car should not experience total acceleration over 10 m/s^2 and jerk that is greater than 10 m/s^3.
+
+#### Results
+As you can see in the figure below, the path planner implemented in main.cpp drove 27.01 miles in 33 minutes and 51 seconds with an average speed of 47.88 mph.
+![Result](1442.png)
+   
+### Simulator.
+You can download the Term3 Simulator which contains the Path Planning Project from the [releases tab (https://github.com/udacity/self-driving-car-sim/releases/tag/T3_v1.2).
 
 #### The map of the highway is in data/highway_map.txt
 Each waypoint in the list contains  [x,y,s,dx,dy] values. x and y are the waypoint's map coordinate position, the s value is the distance along the road to get to that waypoint in meters, the dx and dy values define the unit normal vector pointing outward of the highway loop.
 
 The highway's waypoints loop around so the frenet s value, distance along the road, goes from 0 to 6945.554.
+
+### Implementation
+The path planner is implemented directly in main.cpp for now (in future, hopefully the code will refactored). 
+* **Lines 118-12: ego speed (arrives with a latency and may no longer be valid) and acceleration (acceleration is not provided) are predicted** based on the elapsed time and previous values. Whereas, elapsed time is estimated based on previous points and NOT on direct time measurements
+* **Lines 139-204: Sensor fusion part**. Velocities and freespace for each lane are defined by closest vehicles in each (forward and backward) direction. Lines 157-159: vehicle velocities are translated into Frenet Coordinates. Lines 171-181: By using d and d_dot maneuver can be predicted, i.e. whether lane change is taking place. Note: vehicle that changes lane limits both original and target lanes (lines: 183-202)
+* **Lines 211-226: Estimating costs for each lane** based on the freespace and velocity of a lane. Best cost determines for meneuver. For example: if ego car is in lane 0, and best cost refers to lane 2, then the direction is towards lanes 1 and 2. Even if cost for lane 1 is higher, the ego car will try to change lane in the respective direction.
+* **Lines 230-298: Finite State Machine**, consisting of states "KL", "PLCL", "PLCR", "LCL", "LCR" as discussed in the video lectures. Keep lane is **default**. If direction is not 0, then switch to respective Prepare Lane Change. Depending on the lanes information, either reduce safety buffer between car in front, or decelerate to merge with target lane (lines 257-270). When safe, state is changed to Lane Change (lines 286-298). 
+* **Lines 303-317: Update Jerk** based on reference target speed and space ahead (both depend on current state). 
+* **Lines 328-422: Trajectory Planning**. As a basis, starting code from Q&A of the project is taken with some changes: for example only first point of previous path is re-used, to immediately reflect on the current state (therefore, target lane), velocity, acceleration (lines 340-360). First two points of previous path, as well as points at 30m, 60m, 90m on target lane are used for spline (spline.h) interpolation and as the result path smoothing (lines 362-365). On lines 375-383, points are translated into ego car's coordinate system. On lines 398-422 path is built. Note: that method described in Q&A does not guarantee speed limit compliance, therefore it was slightly rewritten.
 
 ## Basic Build Instructions
 
