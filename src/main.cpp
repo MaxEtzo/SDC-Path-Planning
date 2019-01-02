@@ -4,6 +4,7 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
+#include <string>
 #include <vector>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
@@ -11,7 +12,10 @@
 #include "helper_functions.h"
 #include "spline.h"
 
+#define MAX_VEL_ 49.0/2.24
 using namespace std;
+using hires_clock = chrono::high_resolution_clock;
+using usec = chrono::microseconds;
 
 // for convenience
 using json = nlohmann::json;
@@ -70,13 +74,15 @@ int main() {
 	}
 
 	int target_lane = 1;
-	float ref_vel = 0.0;
-	float ref_acc = 0.0;
-	float max_vel = 49.0 / 2.24;
-	float max_acc = 9.0;
-	float max_jerk = 9.0;
-	h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&max_s,&target_lane,&ref_vel,&ref_acc,&max_vel,&max_acc,&max_jerk](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-				uWS::OpCode opCode) {
+	int next_lane = 1;
+	double ref_vel = 0.0;
+	double ref_acc = 0.0;
+	double ref_jerk = 0.0;
+	double max_vel = MAX_VEL_;
+	double max_acc = 6.0; // only limits tangential acceleration
+	double max_jerk = 6.0; // only limits tangential jerk
+	string state = "KL";
+	h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&max_s,&target_lane,&next_lane,&ref_vel,&ref_acc,&ref_jerk,&max_vel,&max_acc,&max_jerk,&state](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode) {
 			// "42" at the start of the message means there's a websocket message event.
 			// The 4 signifies a websocket message
 			// The 2 signifies a websocket event
@@ -97,8 +103,8 @@ int main() {
 			double car_y = j[1]["y"];
 			double car_s = j[1]["s"];
 			double car_d = j[1]["d"];
-			double car_yaw = j[1]["yaw"];
-			double car_speed = j[1]["speed"];
+			double car_yaw = deg2rad(j[1]["yaw"]);
+			double car_speed = double(j[1]["speed"]) / 2.24;
 			int car_lane = floor(car_d / 4.0);
 
 			// Previous path data given to the Planner
@@ -109,149 +115,259 @@ int main() {
 			double end_path_d = j[1]["end_path_d"];
 			int prev_size = previous_path_x.size();
 
+			// dt since last cycle
+			double dt = (50 - prev_size)*0.02;
+			// estimate current reference velocity and acceleration 
+			ref_acc = max(min(ref_acc + ref_jerk * dt, max_acc), -max_acc);
+			if (prev_size >= 2)
+			{
+				double next_delta_x = double(previous_path_x[1]) - double(previous_path_x[0]);
+				double next_delta_y = double(previous_path_y[1]) - double(previous_path_y[0]);
+				ref_vel = sqrt(next_delta_x*next_delta_x + next_delta_y*next_delta_y)/0.02;
+			}
+			else ref_vel = max(min(ref_vel + ref_acc * dt + 0.5 * ref_jerk * dt * dt, max_vel), 0.0);
+
 			// Sensor Fusion Data, a list of all other cars on the same side of the road.
 			auto sensor_fusion = j[1]["sensor_fusion"];
 			json msgJson;
 			// collect information about the traffic on all lanes
-			float s_horizon = 50.0;
-			float freespace_ahead[3] = {s_horizon, s_horizon, s_horizon};
-			float freespace_behind[3] = {-s_horizon, -s_horizon, -s_horizon};
-			float speed_ahead[3] = {max_vel, max_vel, max_vel};
-			float speed_behind[3] = {0.0, 0.0, 0.0};
+			/*
+			 * Sensor Fusion related code 
+			 * Identify the closest cars ahead and behind in each lane
+			 * Predict if car is changing lane. If yes, it limits both current lane and target lane
+			 */
+			double s_horizon = 40.0;
+			double freespace_ahead[3] = {s_horizon, s_horizon, s_horizon};
+			double freespace_behind[3] = {-s_horizon, -s_horizon, -s_horizon};
+			double speed_ahead[3] = {max_vel, max_vel, max_vel};
+			double speed_behind[3] = {0.0, 0.0, 0.0};
 			for (int i = 0; i < sensor_fusion.size(); i++)
 			{
-				// cars to be checked would be called "check_car"
-				float vx = sensor_fusion[i][3];
-				float vy = sensor_fusion[i][4];
-				float check_car_vel = sqrt(vx*vx + vy*vy);
-				float check_car_s = sensor_fusion[i][5];
-				float check_car_d = sensor_fusion[i][6];
-				int check_lane = floor(check_car_d / 4.0);
+				// cars to be checked would be called "check"
+				double x = sensor_fusion[i][1];
+				double y = sensor_fusion[i][2];
+				double vx = sensor_fusion[i][3];
+				double vy = sensor_fusion[i][4];
+				double check_s = sensor_fusion[i][5];
+				double check_d = sensor_fusion[i][6];
+				int check_lane = floor(check_d / 4.0);
+				if (check_d < 0) 
+					continue;
+
+				vector<double> frenetVel = getFrenetVelocity(x, y, vx, vy, map_waypoints_x, map_waypoints_y); 	
+				double check_s_dot = frenetVel[0];
+				double check_d_dot = frenetVel[1];
+
 				// distance difference between ego and check car
-				float delta_s = check_car_s - car_s;
-				if (delta_s < -max_s + s_horizon) // deal with singularity at 0.
-					delta_s += max_s;
-				if (delta_s > max_s - s_horizon)
-					delta_s -= max_s;
-				if (delta_s < freespace_ahead[check_lane] && delta_s > 0)
+				double delta_s = check_s - car_s;
+				// deal with singularity at max_s = 0.
+				if (fabs(delta_s) >= max_s - s_horizon)
+					delta_s += (delta_s > 0 ? -1 : 1)*max_s;
+
+				// car poses space and velocity limits on both current lane and target lane
+				if (fabs(delta_s) < s_horizon)
 				{
-					freespace_ahead[check_lane] = delta_s;
-					speed_ahead[check_lane] = check_car_vel;	
-				}	
-				else if (delta_s > freespace_behind[check_lane] && delta_s <= 0)
-				{
-					freespace_behind[check_lane] = delta_s;
-					speed_behind[check_lane] = check_car_vel;
+					// predict cars target lane, i.e. any lane change maneuver taking place
+					int check_target_lane = check_lane;
+					double d_offset = check_d-4*check_lane-2;
+					double p = 1.0/(1+exp(-d_offset))+1.0/(1+exp(-check_d_dot))-1;
+					if (p > 0.65)
+					{
+						check_target_lane++;	
+					}
+					else if (p < -0.65)
+					{
+						check_target_lane--;
+					}
+
+					if (delta_s < freespace_ahead[check_lane] && delta_s > 0)
+					{
+						freespace_ahead[check_lane] = delta_s;
+						speed_ahead[check_lane] = check_s_dot;
+					}	
+					else if (delta_s > freespace_behind[check_lane] && delta_s <= 0)
+					{
+						freespace_behind[check_lane] = delta_s;
+						speed_behind[check_lane] = check_s_dot;
+					}
+					if (delta_s < freespace_ahead[check_target_lane] && delta_s > 0)
+					{
+						freespace_ahead[check_target_lane] = delta_s;
+						speed_ahead[check_target_lane] = check_s_dot;	
+					}	
+					else if (delta_s > freespace_behind[check_target_lane] && delta_s <= 0)
+					{
+						freespace_behind[check_target_lane] = delta_s;
+						speed_behind[check_target_lane] = check_s_dot;
+					}
 				}
 			}
-			// calculate costs associated with each possible state
-			// states: Lane Change Left; Keep Lane; Lane Change Right in the same order	
-			// state = -1 represents LCL, 0 - KL, and 1 - LCR
-			float costs[3] = {1E6, 1E6, 1E6};
+
+			/*
+			 * Calculate costs for each lane based on freespace and speed ahead 
+			 * Identify direction towards lower cost lane
+			 * Directions: -1 - Left, 0 - Forward, 1 - Right	
+			 */
+			double costs[3] = {1E6, 1E6, 1E6};
+			double min_cost = 1E6;
+			int target_lane = car_lane;
 			for (int i = 0; i < 3; i++) // iterate through each lane
 			{
-				float cost = (1 - exp(-(s_horizon - freespace_ahead[i])/s_horizon)) + (1 - exp(-(max_vel - speed_ahead[i])/max_vel)); 	
-				int state = max(min(i - target_lane, 1), -1); // no double lane change, but overall direction towards lower cost must be preserved
-				if (cost < costs[state + 1])
-					costs[state + 1] = cost + abs(state) * 0.05; // prefer keep lane over lane chage	
-			}	
+				costs[i] = (1 - exp(-(s_horizon - freespace_ahead[i])/s_horizon)) + (1 - exp(-(max_vel - speed_ahead[i])/max_vel)); 	
+				// prefer KEEP LANE
+				if (i == car_lane)
+					costs[i] -= 0.1;
 
-			// now prediction phases come. prepare some time horizons!
-			float t_hor = 50 * 0.02;
-			float t2 = t_hor * t_hor;
-			float t3 = t2 * t_hor;
-			// find minimum cost
-			float min_cost = 1E6;
-			float safety_buffer = 10;
-			int state = 0;
-			for (int i = 0; i < 3; i++) // iterate through states this time
-			{
-				int next_lane = target_lane + i - 1;
-				// given current ego position, velocity and acceleration 
-				// predict whether merge can happen
-				if (i != 1)
-				{
-					float projection_ahead = freespace_ahead[next_lane] + (speed_ahead[next_lane] - ref_vel)*t_hor - 0.5 * ref_acc*t2;
-					float projection_behind = freespace_behind[next_lane] + (speed_behind[next_lane] - ref_vel)*t_hor - 0.5*ref_acc*t2;
-					if (freespace_ahead[next_lane] < safety_buffer || projection_ahead < safety_buffer)
-						costs[i] += 100.0;
-					else if (freespace_behind[next_lane] > -safety_buffer || projection_behind > -safety_buffer)
-						costs[i] += 100.0;					
-				}
 				if (costs[i] < min_cost)
 				{
 					min_cost = costs[i];
-					state = i - 1;
+					target_lane = i;
 				}
-				std::cout << "cost for state " << i - 1 << " " << costs[i] << std::endl;
+			}
+			int direction = max(min(target_lane - car_lane, 1), -1);
+
+			// Time horizon and its powers
+			double t_hor = 50 * 0.02;
+			double t2 = t_hor * t_hor;
+			double t3 = t2 * t_hor;
+
+			/*
+			 * Based on the direction either keep lane, prepare lane change or execute lane change
+			 */
+			double target_vel = max_vel; // target velocity for ego car
+			double safety_buffer = 20; // default safety_buffer for KEEP LANE
+			double safety_buffer_LC = 10; // safety_buffer for LANE CHANGE
+			double ref_lane_space = freespace_ahead[car_lane]; // reference lane space ahead
+			double ref_lane_speed = speed_ahead[car_lane]; // reference lane speed ahead
+
+			// buffer_ahead and buffer_behind are needed for PLC and LC
+			int intended_lane = car_lane + direction;
+			double buffer_ahead = min(freespace_ahead[intended_lane], freespace_ahead[car_lane]);
+			double buffer_behind = max(freespace_behind[intended_lane], freespace_behind[car_lane]);
+
+			if (state.compare("LC") != 0) // only if Lane Change is not in progress
+			{
+				next_lane = car_lane;
+				if (direction == 0)
+				{
+					state = "KL";
+				} 
+				else // Prepare Lane Change   
+				{
+					if (buffer_ahead - buffer_behind > 2*safety_buffer_LC) // lane change possible -> PREPARE
+					{
+						state = "PLC";
+						ref_lane_space = buffer_ahead;
+						if (freespace_ahead[intended_lane] < freespace_ahead[car_lane] - 0.3)
+						{
+							ref_lane_speed = speed_ahead[intended_lane]; 	
+							target_vel = ref_lane_speed - 1.0; // decelerate to merge into intended_lane
+						}
+						else if (freespace_ahead[car_lane] < freespace_ahead[intended_lane] - 0.3)
+							ref_lane_speed = speed_ahead[car_lane]; // limited by current lane's speed
+						else
+							ref_lane_speed = min(speed_ahead[car_lane], speed_ahead[intended_lane]); // choose minimum of two
+					}
+					else 
+						state = "KL";
+				}
+			}
+			else if (car_lane != next_lane)// ongoing Lane Change; set correct ref_lane_space and ref_lane_speed 
+			{
+				double cur_buffer_ahead = min(freespace_ahead[car_lane], freespace_ahead[next_lane]); // based on next_lane and not direction (in case plan changed)	
+				ref_lane_space = cur_buffer_ahead;
+				if (freespace_ahead[next_lane] < freespace_ahead[car_lane] - 0.5)
+					ref_lane_speed = speed_ahead[next_lane];	
+				else if (freespace_ahead[car_lane] < freespace_ahead[next_lane] - 0.5)
+					ref_lane_speed = speed_ahead[car_lane];
+				else
+					ref_lane_speed = min(speed_ahead[car_lane], speed_ahead[next_lane]);
+			}
+			if (state.compare("PLC") == 0) // Lane change only after PLC 
+			{
+				if (buffer_ahead > safety_buffer_LC && buffer_behind < -safety_buffer_LC) // check if change lane can be initiated
+				{
+					state = "LC";
+					next_lane = car_lane + direction;
+					// printing out
+					string dir = (direction > 0 ? "Right" : "Left");
+					cout << "Lane Change " << dir << " INITIATED" << endl;
+					cout << "Target Lane " << target_lane << endl;
+					cout << "Next Lane " << next_lane << endl;
+				}
 			}
 
-			// check if previous maneuver is completed (e.g. change lane or recovery to lane center)
-			float eps = 0.2;
-			if (fabs(car_d - 4*target_lane - 2) < eps)
+			if (state.compare("PLC") == 0 || state.compare("LC") == 0)
+				safety_buffer = safety_buffer_LC;
+
+			/*
+			 * Control Jerk, acceleration and speed!
+			 */
+			double projection_space = ref_lane_space + (ref_lane_speed - ref_vel) * t_hor  - 0.5 * ref_acc * t2;
+			double projection_speed = ref_vel + ref_acc * t_hor;
+			if (projection_space < safety_buffer)
 			{
-				target_lane += state;
+				// for safety max_jerk can be used
+				ref_jerk = max(min(6 * (projection_space - safety_buffer) / t3, max_jerk), -max_jerk);
+			}
+			else // use reduced jerk;
+			{
+				double red_jerk = max_jerk * 1.0;
+				ref_jerk = max(min(2 * (target_vel - projection_speed) / t2, red_jerk), -red_jerk);
 			}
 
-			// control jerk, acceleration and speed to avoid accidents
-			float dt = 0.05; // empirically measured
-			float projection_ahead = freespace_ahead[car_lane] + (speed_ahead[car_lane] - ref_vel) * t_hor  - 0.5 * ref_acc * t2;
-			float projection_vel = ref_vel + ref_acc * t_hor;
-			float jerk = 0.0;
-			if (projection_ahead < safety_buffer)
+			// check if lane change completed (update state to KL)
+			double eps = 0.7;
+			if (state.compare("LC") == 0 && fabs(car_d - 4*next_lane - 2) < eps) 
 			{
-				jerk = max(6 * (projection_ahead - safety_buffer) / t3, -max_jerk);
-			}
-			else if (projection_vel > max_vel) 
-			{
-				jerk = max(2 * (max_vel - projection_vel) / t2, -max_jerk);
-			}
-			else if (projection_vel < max_vel && ref_acc < max_acc)
-			{
-				jerk = min(2 * (max_vel - projection_vel) / t2, max_jerk);
-			}
-			ref_acc = max(min(ref_acc + jerk * dt, max_acc), -max_acc);
-			ref_vel = max(min(ref_vel + ref_acc * dt, max_vel), 0.0f); // no reverse movement on the highway
-			std::cout << "current jerk: " << jerk << std::endl;
-			std::cout << "current acceleration: " << ref_acc << std::endl;	
-			std::cout << "current velocity: " << ref_vel << std::endl;
-
-			// trajectory planning starts here
+				state = "KL";
+				cout << "Lane Change COMPLETED" << endl;
+				cout << "Current Lane " << car_lane << endl;
+				cout << "Target Lane " << target_lane << endl;
+			} 
+			/* 
+			 * trajectory planning starts here
+			 */
+			vector<double> next_x_vals;
+			vector<double> next_y_vals;
 			vector<double> ptsx;
 			vector<double> ptsy;
 
 			double ref_x = car_x;
 			double ref_y = car_y;
-			double ref_yaw = deg2rad(car_yaw);
-			double ref_x_prev;
-			double ref_y_prev;
-			if (prev_size < 2)// no previous path, use two points tangent to the car
+			double ref_yaw = car_yaw;
+
+			if (prev_size < 2) // no previous path, use two points tangent to the car
 			{
-				double ref_x_prev = ref_x - cos(ref_yaw);
-				double ref_y_prev = ref_y - sin(ref_yaw);
+				ptsx.push_back(ref_x - cos(ref_yaw));
+				ptsx.push_back(ref_x);
+				ptsy.push_back(ref_y - sin(ref_yaw));
+				ptsy.push_back(ref_y);
+				prev_size = 0;
 			}
-			else // use first two previous paths point for smooth transition, and yet to reflect latest controls (jerk, acc, vel)
+			else // use only first two points for smooth transition (for spline), and first point for next values
 			{
-				ref_x = previous_path_x[1];
-				ref_y = previous_path_y[1];
-				ref_x_prev = previous_path_x[0];
-				ref_y_prev = previous_path_y[0];
-				ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+				ptsx.push_back(previous_path_x[0]);
+				ptsx.push_back(previous_path_x[1]);
+				ptsy.push_back(previous_path_y[0]);
+				ptsy.push_back(previous_path_y[1]);
+				next_x_vals.push_back(ptsx[0]);
+				next_y_vals.push_back(ptsy[0]);
+				ref_x = ptsx[0];
+				ref_y = ptsy[0];
+				ref_yaw = atan2(ref_y - car_y, ref_x - car_x);
+				prev_size = 1;
 			}
 
-			ptsx.push_back(ref_x_prev);
-			ptsx.push_back(ref_x);
-			ptsy.push_back(ref_y_prev);
-			ptsy.push_back(ref_y);
-			
-			vector<double> next_wp0 = getXY(car_s + 40, (2+4*target_lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-			vector<double> next_wp1 = getXY(car_s + 70, (2+4*target_lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-			vector<double> next_wp2 = getXY(car_s + 100, (2+4*target_lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-			
+			double delta_d = -0.2 * (next_lane - 1);// slightly avoid road boundaries (easy to catch outside of lane error due to interpolation)
+			vector<double> next_wp0 = getXY(car_s + 30, (2+4*next_lane)+delta_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp1 = getXY(car_s + 60, (2+4*next_lane)+delta_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp2 = getXY(car_s + 90, (2+4*next_lane)+delta_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
 			ptsx.push_back(next_wp0[0]);
 			ptsx.push_back(next_wp1[0]);
 			ptsx.push_back(next_wp2[0]);
-			
+
 			ptsy.push_back(next_wp0[1]);
 			ptsy.push_back(next_wp1[1]);
 			ptsy.push_back(next_wp2[1]);
@@ -265,44 +381,42 @@ int main() {
 				ptsx[i] = shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw);
 				ptsy[i] = shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw);
 			}
-			
+
 			// create a spline
 			tk::spline s;
 			s.set_points(ptsx, ptsy);
 
-			vector<double> next_x_vals;
-			vector<double> next_y_vals;
-
 			// calculate how to break up spline points so that we travel at our desired reference velocity
+			double accel = ref_acc; // max(min(ref_acc + ref_jerk * 0.02, max_acc), -max_acc);
+			double speed = ref_vel;
+
 			double target_x = 30.0;
 			double target_y = s(target_x);
-			double target_dist = sqrt(target_x*target_x + target_y*target_y);
-			double N = target_dist / (0.02*ref_vel);
 			double x_last = 0;
 			double y_last = 0;
-			if (prev_size > 1)
+
+			for (int i = prev_size; i < 50; i++)
 			{
-				next_x_vals.push_back(previous_path_x[0]);
-				next_x_vals.push_back(previous_path_x[1]);
-				next_y_vals.push_back(previous_path_y[0]);
-				next_y_vals.push_back(previous_path_y[1]);
-			}
-			for (int i = 0; i < 50; i++)
-			{
-				double x_point = x_last + (target_x)/N;
+				double delta_x = target_x - x_last;
+				double delta_y = target_y - y_last;	
+				double target_dist = sqrt(delta_x*delta_x + delta_y*delta_y);
+				double N = target_dist / (0.02*speed);
+				double x_point = x_last + (delta_x)/N;
 				double y_point = s(x_point);
 				// points above do not guarantee speed limit compliance!
-				
 				double yaw = atan2(y_point - y_last, x_point - x_last);
-				x_point = x_last + cos(yaw) * ref_vel * 0.02;
-				y_point = y_last + sin(yaw) * ref_vel * 0.02;
+				x_point = x_last + cos(yaw) * speed * 0.02;
+				y_point = y_last + sin(yaw) * speed * 0.02;
 				x_last = x_point;
 				y_last = y_point;
+				// update speed and accel
+				accel = max(min(accel + ref_jerk * 0.02, max_acc), -max_acc);
+				speed = max(min(speed + accel * 0.02, max_vel), 0.0);
 
-				// translate back to global coordinate system
+				// translate back to global coordinate systeref
 				x_point = x_last * cos(ref_yaw) - y_last * sin(ref_yaw) + ref_x;
 				y_point = x_last * sin(ref_yaw) + y_last * cos(ref_yaw) + ref_y;
-				
+
 				next_x_vals.push_back(x_point);
 				next_y_vals.push_back(y_point);
 			}
@@ -359,4 +473,3 @@ int main() {
 	}
 	h.run();
 }
-

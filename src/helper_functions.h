@@ -15,6 +15,28 @@ constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
 
+// function returns minimum positive root of quadratic equation if one exists, else -1.0
+double minPositiveRoot(double a, double b, double c)
+{
+	double d = b*b-4*a*c;
+	double r = -1.0;
+	if (d >= 0)
+		if (fabs(a) > 1E-20) 
+		{
+			double r1 = 0.5*(-b + sqrt(d)) / a;
+			double r2 = 0.5*(-b - sqrt(d)) / a;
+			// take minimum of positive 
+			double minr = min(r1, r2);
+			double maxr = max(r1, r2);
+			if (minr > 0)
+				r = minr;
+			else if (maxr > 0)
+				r = maxr;
+		}
+
+	return r;
+}
+
 double distance(double x1, double y1, double x2, double y2)
 {
 	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
@@ -115,6 +137,26 @@ vector<double> getFrenet(double x, double y, double theta, const vector<double> 
 
 	return {frenet_s,frenet_d};
 
+}
+
+vector<double> getFrenetVelocity(double x, double y, double vx, double vy, const vector<double> &maps_x, const vector<double> &maps_y)
+{
+	double v_theta = atan2(vy, vx);
+	double v = sqrt(vx*vx+vy*vy);
+	int next_wp = NextWaypoint(x,y, v_theta, maps_x,maps_y);
+	int prev_wp = next_wp-1;
+	if(next_wp == 0)
+	{
+		prev_wp  = maps_x.size()-1;
+	}
+
+	double n_x = maps_x[next_wp]-maps_x[prev_wp];
+	double n_y = maps_y[next_wp]-maps_y[prev_wp];
+	double s_theta = atan2(n_y, n_x);
+	double s_dot = v*cos(v_theta - s_theta);
+	double d_dot = -v*sin(v_theta - s_theta);
+
+	return {s_dot, d_dot};
 }
 
 // Transform from Frenet s,d coordinates to Cartesian x,y
